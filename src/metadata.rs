@@ -1,6 +1,32 @@
 use std::error::Error;
+use std::fmt::{Display, Formatter};
 use serde_json::{json, Value};
 use reqwest::Url;
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum RestServiceMetadataError {
+    FieldParsing(String, String),
+    FieldTypeParsing(String),
+    MissingKey(String),
+}
+
+impl Display for RestServiceMetadataError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RestServiceMetadataError::FieldParsing(message, field_json) => {
+                write!(f, "Message:\n{}\nRaw JSON:\n{}", message, field_json)
+            }
+            RestServiceMetadataError::FieldTypeParsing(field_type) => {
+                write!(f, "Invalid Field Type: {}", field_type)
+            }
+            RestServiceMetadataError::MissingKey(key) => {
+                write!(f, "Missing required key: {}", key)
+            }
+        }
+    }
+}
+
+impl Error for RestServiceMetadataError {}
 
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) enum RestServiceFieldType {
@@ -21,7 +47,9 @@ pub(crate) enum RestServiceFieldType {
 }
 
 impl RestServiceFieldType {
-    pub(crate) fn from_str(field_type: &str) -> Result<RestServiceFieldType, &str> {
+    pub(crate) fn from_str(
+        field_type: &str,
+    ) -> Result<RestServiceFieldType, RestServiceMetadataError> {
         match field_type {
             "esriFieldTypeBlob" => Ok(RestServiceFieldType::Blob),
             "esriFieldTypeDate" => Ok(RestServiceFieldType::Date),
@@ -37,8 +65,127 @@ impl RestServiceFieldType {
             "esriFieldTypeSmallInteger" => Ok(RestServiceFieldType::SmallInteger),
             "esriFieldTypeString" => Ok(RestServiceFieldType::String),
             "esriFieldTypeXML" => Ok(RestServiceFieldType::XML),
-            _ => Err("Could not decode the field type")
+            _ => Err(
+                RestServiceMetadataError::FieldTypeParsing(
+                    format!("Could not decode the field type of \"{}\"", field_type)
+                )
+            )
         }
+    }
+}
+
+#[cfg(test)]
+mod rest_service_field_type_tests {
+    use super::{RestServiceFieldType, RestServiceMetadataError};
+
+    #[test]
+    fn from_str_should_return_blob_when_passed_blob_field_type() -> Result<(), RestServiceMetadataError> {
+        let result = RestServiceFieldType::from_str("esriFieldTypeBlob")?;
+        assert_eq!(result, RestServiceFieldType::Blob);
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_should_return_data_when_passed_data_field_type() -> Result<(), RestServiceMetadataError> {
+        let result = RestServiceFieldType::from_str("esriFieldTypeDate")?;
+        assert_eq!(result, RestServiceFieldType::Date);
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_should_return_double_when_passed_double_field_type() -> Result<(), RestServiceMetadataError> {
+        let result = RestServiceFieldType::from_str("esriFieldTypeDouble")?;
+        assert_eq!(result, RestServiceFieldType::Double);
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_should_return_float_when_passed_float_field_type() -> Result<(), RestServiceMetadataError> {
+        let result = RestServiceFieldType::from_str("esriFieldTypeFloat")?;
+        assert_eq!(result, RestServiceFieldType::Float);
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_should_return_geometry_when_passed_geometry_field_type() -> Result<(), RestServiceMetadataError> {
+        let result = RestServiceFieldType::from_str("esriFieldTypeGeometry")?;
+        assert_eq!(result, RestServiceFieldType::Geometry);
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_should_return_global_id_when_passed_global_id_field_type() -> Result<(), RestServiceMetadataError> {
+        let result = RestServiceFieldType::from_str("esriFieldTypeGlobalID")?;
+        assert_eq!(result, RestServiceFieldType::GlobalID);
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_should_return_guid_when_passed_guid_field_type() -> Result<(), RestServiceMetadataError> {
+        let result = RestServiceFieldType::from_str("esriFieldTypeGUID")?;
+        assert_eq!(result, RestServiceFieldType::GUID);
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_should_return_integer_when_passed_integer_field_type() -> Result<(), RestServiceMetadataError> {
+        let result = RestServiceFieldType::from_str("esriFieldTypeInteger")?;
+        assert_eq!(result, RestServiceFieldType::Integer);
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_should_return_oid_when_passed_oid_field_type() -> Result<(), RestServiceMetadataError> {
+        let result = RestServiceFieldType::from_str("esriFieldTypeOID")?;
+        assert_eq!(result, RestServiceFieldType::OID);
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_should_return_raster_when_passed_raster_field_type() -> Result<(), RestServiceMetadataError> {
+        let result = RestServiceFieldType::from_str("esriFieldTypeRaster")?;
+        assert_eq!(result, RestServiceFieldType::Raster);
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_should_return_single_when_passed_single_field_type() -> Result<(), RestServiceMetadataError> {
+        let result = RestServiceFieldType::from_str("esriFieldTypeSingle")?;
+        assert_eq!(result, RestServiceFieldType::Single);
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_should_return_small_integer_when_passed_small_integer_field_type() -> Result<(), RestServiceMetadataError> {
+        let result = RestServiceFieldType::from_str("esriFieldTypeSmallInteger")?;
+        assert_eq!(result, RestServiceFieldType::SmallInteger);
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_should_return_string_when_passed_string_field_type() -> Result<(), RestServiceMetadataError> {
+        let result = RestServiceFieldType::from_str("esriFieldTypeString")?;
+        assert_eq!(result, RestServiceFieldType::String);
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_should_return_xml_when_passed_xml_field_type() -> Result<(), RestServiceMetadataError> {
+        let result = RestServiceFieldType::from_str("esriFieldTypeXML")?;
+        assert_eq!(result, RestServiceFieldType::XML);
+        Ok(())
+    }
+
+    #[test]
+    fn from_str_should_fail_when_passed_invalid_field_type() {
+        let result = RestServiceFieldType::from_str("esriFieldTypeUnknown");
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err(),
+            RestServiceMetadataError::FieldTypeParsing(
+                "Could not decode the field type of \"esriFieldTypeUnknown\"".to_owned()
+            ),
+        );
     }
 }
 
@@ -50,16 +197,36 @@ pub struct RestServiceField {
 }
 
 impl RestServiceField {
-    fn new(
-        name: &str,
-        field_type: &str,
-        alias: &str,
-    ) -> Result<RestServiceField, Box<dyn Error>> {
+    fn new(field: &Value) -> Result<RestServiceField, RestServiceMetadataError> {
+        let field_name = field["name"]
+            .as_str()
+            .ok_or(
+                RestServiceMetadataError::FieldParsing(
+                    "No name found".to_owned(),
+                    field.to_owned().to_string(),
+                )
+            )?;
+        let field_type = field["type"]
+            .as_str()
+            .ok_or(
+                RestServiceMetadataError::FieldParsing(
+                    "No type found".to_owned(),
+                    field.to_owned().to_string(),
+                )
+            )?;
+        let field_alias = field["alias"]
+            .as_str()
+            .ok_or(
+                RestServiceMetadataError::FieldParsing(
+                    "No alias found".to_owned(),
+                    field.to_owned().to_string(),
+                )
+            )?;
         let field_type_enum = RestServiceFieldType::from_str(field_type)?;
         let result = RestServiceField {
-            name: name.to_string(),
+            name: field_name.to_owned(),
             field_type: field_type_enum,
-            alias: alias.to_string(),
+            alias: field_alias.to_owned(),
         };
         Ok(result)
     }
@@ -70,7 +237,7 @@ pub(crate) struct RestServiceMetadata {
     url: String,
     name: String,
     source_count: Option<u64>,
-    max_record_count: Option<u64>,
+    max_record_count: u64,
     stats_enabled: bool,
     pagination_enabled: bool,
     server_type: String,
@@ -82,22 +249,25 @@ pub(crate) struct RestServiceMetadata {
     spatial_reference: Option<u64>,
 }
 
-fn field_is_not_shape(field: &Value) -> bool {
-    field["name"].as_str().unwrap_or_default() != "Shape"
+#[cfg(test)]
+mod misc_tests {
+
+    #[test]
+    fn parse_fields_should_succeed_when_passed_valid_json_array() {
+
+    }
 }
 
-fn field_is_not_geometry(field: &Value) -> bool {
-    field["type"].as_str().unwrap_or_default() != "esriFieldTypeGeometry"
-}
-
-fn parse_fields(fields_json: &Vec<Value>, geo_type: &str) -> Vec<RestServiceField> {
+fn parse_fields(
+    fields_json: &Vec<Value>,
+    geo_type: &str,
+) -> Result<Vec<RestServiceField>, RestServiceMetadataError> {
     let mut fields: Vec<RestServiceField> = fields_json.iter()
-        .filter(|field| field_is_not_shape(field) && field_is_not_geometry(field))
-        .flat_map(|field| RestServiceField::new(
-            field["name"].as_str().unwrap_or_default(),
-            field["type"].as_str().unwrap_or_default(),
-            field["alias"].as_str().unwrap_or_default(),
-        ))
+        .map(|field| RestServiceField::new(field))
+        .collect::<Result<Vec<RestServiceField>, RestServiceMetadataError>>()?
+        .into_iter()
+        .filter(|field| field.field_type != RestServiceFieldType::Geometry)
+        .filter(|field| field.name.to_uppercase() != "SHAPE")
         .collect();
     match geo_type {
         "esriGeometryPoint" => {
@@ -124,7 +294,7 @@ fn parse_fields(fields_json: &Vec<Value>, geo_type: &str) -> Vec<RestServiceFiel
         }),
         _ => {},
     };
-    fields
+    Ok(fields)
 }
 
 fn advanced_options(metadata_json: &Value) -> (bool, bool) {
@@ -264,24 +434,28 @@ pub(crate) async fn request_service_metadata(
     let client = reqwest::Client::new();
     let source_count = get_service_count(&client, url).await?;
     let metadata_json = get_service_metadata(&client, url).await?;
-    let name = metadata_json["name"].as_str().unwrap_or_default().to_string();
+    let name = metadata_json["name"]
+        .as_str()
+        .ok_or(RestServiceMetadataError::MissingKey("name".to_owned()))?
+        .to_owned();
     let max_record_count = metadata_json["maxRecordCount"]
-        .as_u64();
+        .as_u64()
+        .ok_or(RestServiceMetadataError::MissingKey("maxRecordCount".to_owned()))?;
     let (stats_enabled, pagination_enabled) = advanced_options(&metadata_json);
     let server_type = metadata_json["type"]
         .as_str()
-        .unwrap_or_default()
-        .to_string();
+        .ok_or(RestServiceMetadataError::MissingKey("type[server]".to_owned()))?
+        .to_owned();
     let geo_type = metadata_json["geometryType"]
         .as_str()
-        .unwrap_or_default();
-    let fields = metadata_json["fields"]
+        .ok_or(RestServiceMetadataError::MissingKey("geometryType".to_owned()))?;
+    let fields_json = metadata_json["fields"]
         .as_array()
-        .map(|fields| parse_fields(fields, geo_type))
-        .unwrap_or_default();
+        .ok_or(RestServiceMetadataError::MissingKey("fields".to_owned()))?;
+    let fields = parse_fields(fields_json, geo_type)?;
     let oid_field = fields.iter()
         .find(|field| field.field_type == RestServiceFieldType::OID)
-        .map(|field| field.clone());
+        .map(|field| field.to_owned());
     let spatial_reference = metadata_json["sourceSpatialReference"]
         .as_object()
         .and_then(|obj| obj["wkid"].as_u64());
@@ -289,7 +463,7 @@ pub(crate) async fn request_service_metadata(
         get_service_max_min(
             &client,
             url,
-            oid_field.clone().unwrap().name,
+            oid_field.to_owned().unwrap().name,
             stats_enabled
         ).await?
     } else {
@@ -302,14 +476,14 @@ pub(crate) async fn request_service_metadata(
         None
     };
     let rest_metadata = RestServiceMetadata {
-        url: url.to_string(),
+        url: url.to_owned(),
         name,
         source_count,
         max_record_count,
         pagination_enabled,
         stats_enabled,
         server_type,
-        geo_type: geo_type.to_string(),
+        geo_type: geo_type.to_owned(),
         fields,
         oid_field,
         max_min_oid,
