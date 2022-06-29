@@ -1,4 +1,5 @@
 mod metadata;
+mod scraping;
 
 use metadata::request_service_metadata;
 use std::error::Error;
