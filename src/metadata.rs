@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::fmt::{Display, format, Formatter};
+use std::fmt::{Display, Formatter};
 use serde_json::{json, Value};
 use reqwest::Url;
 
