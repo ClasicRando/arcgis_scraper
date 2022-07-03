@@ -3,10 +3,12 @@ mod scraping;
 
 use metadata::request_service_metadata;
 use std::error::Error;
-use std::fs::File;
+use std::fs::{create_dir, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use chrono::{Utc};
 use tokio::task::JoinHandle;
+use std::env;
+use std::path::Path;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 10)]
 async fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
@@ -34,7 +36,12 @@ async fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
         fetch_worker_handles.push(handle);
     }
 
-    let output_filename = format!("/home/steven/IdeaProjects/arcgis_scraper/{}.csv", result.name);
+    let output_path_sting = format!("{}/output_files", env::current_dir()?.display());
+    let output_path = Path::new(output_path_sting.as_str());
+    if !output_path.is_dir() {
+        create_dir(output_path)?;
+    }
+    let output_filename = format!("{}/{}.csv", output_path.display(), result.name);
     let mut output_file = File::create(output_filename)?;
     let header_line = result.fields.iter()
         .map(|field|
@@ -67,7 +74,6 @@ async fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     }
 
     let end = Utc::now();
-    println!("Result:\n{:#?}", result);
     println!("Took {} ms", end.signed_duration_since(start).num_milliseconds());
     Ok(())
 }
