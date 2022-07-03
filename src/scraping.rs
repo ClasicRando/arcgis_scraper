@@ -1,17 +1,14 @@
-use std::cmp::max;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Write};
 use std::time::Duration;
-use reqwest::{Client, StatusCode, Url};
+use reqwest::{Client, StatusCode};
 use serde_json::{json, Map, Value};
-use tempfile::{tempfile};
-use crate::metadata::RestServiceGeometryType;
+use crate::metadata::{RestServiceField, RestServiceFieldType, RestServiceGeometryType};
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum RestServiceScrapingError {
-    UnknownValueType(String, String),
     MissingKey(String, String),
     InvalidResponse(StatusCode),
     InvalidJsonResponse(String),
@@ -24,9 +21,6 @@ pub(crate) enum RestServiceScrapingError {
 impl Display for RestServiceScrapingError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            RestServiceScrapingError::UnknownValueType(json_type, raw_string) => {
-                write!(f, "JSON type: {}\nRaw JSON:\n{}", json_type, raw_string)
-            }
             RestServiceScrapingError::MissingKey(key, raw_json) => {
                 write!(f, "Key: {}\nRaw JSON:\n{}", key, raw_json)
             }
@@ -71,6 +65,23 @@ fn convert_json_value(json_value: &Value) -> Result<String, RestServiceScrapingE
         Value::String(string) => Ok(string.to_owned()),
         Value::Array(arr) => Ok(json!(arr).to_string()),
         Value::Object(obj) => Ok(json!(obj).to_string()),
+    }
+}
+
+fn convert_json_field(
+    field: &RestServiceField,
+    json_value: &Value,
+) -> Result<Vec<String>, RestServiceScrapingError> {
+    if let Some(codes) = &field.codes {
+        let code = convert_json_value(json_value)?;
+        let value = codes.get(&code);
+        if let Some(description) = value {
+            Ok(vec![code, description.to_owned()])
+        } else {
+            Ok(vec![code, "".to_owned()])
+        }
+    } else {
+        Ok(vec![convert_json_value(json_value)?])
     }
 }
 
@@ -183,6 +194,7 @@ fn convert_geometry(
 }
 
 fn handle_record(
+    fields: &Vec<RestServiceField>,
     geo_type: &RestServiceGeometryType,
     feature: &Map<String, Value>,
 ) -> Result<Vec<String>, RestServiceScrapingError> {
@@ -194,23 +206,34 @@ fn handle_record(
                 format!("{:?}", feature),
             )
         )?;
-    let mut record = attributes.values()
-        .map(|value| convert_json_value(value))
-        .collect::<Result<Vec<String>, RestServiceScrapingError>>()?;
+    let mut record: Vec<String> = vec![];
+    for field in fields {
+        if field.field_type == RestServiceFieldType::Geometry {
+            continue
+        }
+        let mut values = convert_json_field(
+            &field,
+            &attributes[field.name.as_str()]
+        )?;
+        record.append(&mut values);
+    }
     for geometry_field in convert_geometry(geo_type, feature)? {
         record.push(geometry_field)
     }
     Ok(record)
 }
 
-fn handle_csv_value(value: &String) -> String {
+pub(crate) fn handle_csv_value(value: &String) -> String {
     if value.chars().any(|chr| chr == '\r' || chr == '\n' || chr == ',' || chr == '"') {
         return format!("\"{}\"", value.replace("\"", "\"\""));
     }
     value.to_owned()
 }
 
-async fn try_query(client: &Client, query: &String) -> Result<Map<String, Value>, Box<dyn Error>> {
+async fn try_query(
+    client: &Client,
+    query: &String,
+) -> Result<Map<String, Value>, Box<dyn Error + Send + Sync>> {
     let response = client.get(query)
         .send()
         .await?;
@@ -237,49 +260,63 @@ async fn try_query(client: &Client, query: &String) -> Result<Map<String, Value>
     Ok(json_object.to_owned())
 }
 
-async fn fetch_query(
+async fn decode_fetch_error(
+    attempts: &mut i32,
+    error: Box<dyn Error + Send + Sync>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    println!("Request had an error...");
+    match error.downcast_ref::<RestServiceScrapingError>() {
+        Some(scraping_error) => {
+            match scraping_error {
+                RestServiceScrapingError::InvalidResponse(code) => {
+                    *attempts += 1;
+                    println!("Error Status Code: {}", code);
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    println!("Trying request again");
+                    Ok(())
+                }
+                RestServiceScrapingError::InvalidJsonResponse(res) => {
+                    *attempts += 1;
+                    println!("Error JSON: {}", res);
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    println!("Trying request again");
+                    Ok(())
+                }
+                RestServiceScrapingError::ErrorJsonResponse(res) => {
+                    *attempts += 1;
+                    println!("Error JSON: {}", res);
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    println!("Trying request again");
+                    Ok(())
+                }
+                RestServiceScrapingError::UnknownJsonResponse(res) => {
+                    *attempts += 1;
+                    println!("Error JSON: {}", res);
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    println!("Trying request again");
+                    Ok(())
+                }
+                _ => return Err(error)
+            }
+        }
+        None => {
+            Err(error)
+        }
+    }
+}
+
+async fn loop_until_successful(
     client: &Client,
     query: &String,
-    geo_type: &RestServiceGeometryType,
     max_tries: i32,
-) -> Result<File, Box<dyn Error>> {
-    let mut file = tempfile()?;
+) -> Result<Map<String, Value>, Box<dyn Error + Send + Sync>> {
     let mut attempts = 0;
-
-    let json_response_object = loop {
+    let result = loop {
         match try_query(client, query).await {
             Err(error) => {
-                println!("Request had an error...");
-                if let Some(scraping_error) = error.downcast_ref::<RestServiceScrapingError>() {
-                    match scraping_error {
-                        RestServiceScrapingError::InvalidResponse(code) => {
-                            attempts += 1;
-                            println!("Error Status Code: {}", code);
-                            tokio::time::sleep(Duration::from_secs(10)).await;
-                            println!("Trying request again");
-                        }
-                        RestServiceScrapingError::InvalidJsonResponse(res) => {
-                            attempts += 1;
-                            println!("Error JSON: {}", res);
-                            tokio::time::sleep(Duration::from_secs(10)).await;
-                            println!("Trying request again");
-                        }
-                        RestServiceScrapingError::ErrorJsonResponse(res) => {
-                            attempts += 1;
-                            println!("Error JSON: {}", res);
-                            tokio::time::sleep(Duration::from_secs(10)).await;
-                            println!("Trying request again");
-                        }
-                        RestServiceScrapingError::UnknownJsonResponse(res) => {
-                            attempts += 1;
-                            println!("Error JSON: {}", res);
-                            tokio::time::sleep(Duration::from_secs(10)).await;
-                            println!("Trying request again");
-                        }
-                        _ => return Err(error)
-                    }
-                } else {
-                    return Err(error)
+                match decode_fetch_error(&mut attempts, error).await {
+                    Err(decode_error) => return Err(decode_error),
+                    Ok(_) => {},
                 }
             }
             Ok(obj) => break obj
@@ -288,6 +325,23 @@ async fn fetch_query(
             return Err(Box::new(RestServiceScrapingError::TooManyRetires(max_tries)))
         }
     };
+    Ok(result)
+}
+
+pub(crate) async fn fetch_query(
+    client: &Client,
+    query: &String,
+    fields: &Vec<RestServiceField>,
+    geo_type: &RestServiceGeometryType,
+    max_tries: i32,
+) -> Result<File, Box<dyn Error + Send + Sync>> {
+    let mut file = tempfile::tempfile()?;
+
+    let json_response_object = loop_until_successful(
+        client,
+        query,
+        max_tries,
+    ).await?;
     let features = json_response_object["features"].as_array().unwrap();
     for feature_value in features {
         let feature = feature_value.as_object()
@@ -296,13 +350,13 @@ async fn fetch_query(
                     RestServiceScrapingError::InvalidFeature(feature_value.to_string())
                 )
             )?;
-        let record = handle_record(geo_type, feature)?;
+        let record = handle_record(fields, geo_type, feature)?;
         let record_transformed = record.iter()
             .map(|value| handle_csv_value(value))
             .collect::<Vec<String>>()
             .join(",");
-        file.write(record_transformed.as_bytes())?;
-        file.write(&[b'\n'])?;
+        writeln!(&mut file, "{}", record_transformed)?;
     }
+    file.sync_all()?;
     Ok(file)
 }

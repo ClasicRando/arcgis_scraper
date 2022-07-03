@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use serde_json::{json, Value};
@@ -7,7 +8,6 @@ use reqwest::Url;
 pub(crate) enum RestServiceMetadataError {
     FieldParsing(String, String),
     FieldTypeParsing(String),
-    GeometryTypeParsing(String),
     MissingKey(String),
     MissingOidField,
 }
@@ -20,9 +20,6 @@ impl Display for RestServiceMetadataError {
             }
             RestServiceMetadataError::FieldTypeParsing(field_type) => {
                 write!(f, "Invalid Field Type: {}", field_type)
-            }
-            RestServiceMetadataError::GeometryTypeParsing(geo_type) => {
-                write!(f, "Invalid Geometry Type: {}", geo_type)
             }
             RestServiceMetadataError::MissingKey(key) => {
                 write!(f, "Missing required key: {}", key)
@@ -240,10 +237,63 @@ mod rest_service_field_type_tests {
 }
 
 #[derive(Debug, Clone)]
-pub struct RestServiceField {
-    name: String,
-    field_type: RestServiceFieldType,
+pub(crate) struct RestServiceField {
+    pub(crate) name: String,
+    pub(crate) field_type: RestServiceFieldType,
     alias: String,
+    pub(crate) codes: Option<HashMap<String, String>>,
+}
+
+fn parse_domain(
+    domain_value: &Value,
+) -> Result<Option<HashMap<String, String>>, RestServiceMetadataError> {
+    match domain_value {
+        Value::Object(domain) => {
+            let is_code = domain["type"].as_str().unwrap_or_default() == "codedValue";
+            if !is_code {
+                return Ok(None)
+            }
+            let coded_values = domain["codedValues"].as_array()
+                .ok_or(
+                    RestServiceMetadataError::FieldParsing(
+                        "codedValues value is not an object".to_owned(),
+                        domain["codedValues"].to_string().to_owned(),
+                    )
+                )?;
+            let mut codes = HashMap::new();
+            for coded_value in coded_values {
+                let coded_value_obj = coded_value.as_object()
+                    .ok_or(
+                        RestServiceMetadataError::FieldParsing(
+                            "codedValues value is not an object".to_owned(),
+                            domain["codedValues"].to_string().to_owned(),
+                        )
+                    )?;
+                let code = match &coded_value_obj["code"] {
+                    Value::Number(num) => num.to_string(),
+                    Value::String(string) => string.to_owned(),
+                    _ => return Err(
+                        RestServiceMetadataError::FieldParsing(
+                            "Expected Number or String for code Value".to_owned(),
+                            coded_value_obj["code"].to_string(),
+                        )
+                    ),
+                };
+                let name = match &coded_value_obj["name"] {
+                    Value::String(string) => string.to_owned(),
+                    _ => return Err(
+                        RestServiceMetadataError::FieldParsing(
+                            "Expected String for name Value".to_owned(),
+                            coded_value_obj["code"].to_string(),
+                        )
+                    ),
+                };
+                codes.insert(code, name);
+            }
+            Ok(Some(codes))
+        },
+        _ => Ok(None)
+    }
 }
 
 impl RestServiceField {
@@ -273,26 +323,37 @@ impl RestServiceField {
                 )
             )?;
         let field_type_enum = RestServiceFieldType::from_str(field_type)?;
+        let domain_value = &field["domain"];
+        let codes = parse_domain(domain_value)?;
         let result = RestServiceField {
             name: field_name.to_owned(),
             field_type: field_type_enum,
             alias: field_alias.to_owned(),
+            codes,
         };
         Ok(result)
+    }
+
+    fn for_geometry(name: &str) -> RestServiceField {
+        RestServiceField {
+            name: name.to_owned(),
+            field_type: RestServiceFieldType::Geometry,
+            alias: name.to_owned(),
+            codes: None
+        }
     }
 }
 
 #[derive(Debug)]
 pub(crate) struct RestServiceMetadata {
     url: String,
-    name: String,
+    pub(crate) name: String,
     source_count: Option<i64>,
     max_record_count: i64,
-    stats_enabled: bool,
     pagination_enabled: bool,
     server_type: String,
-    geo_type: RestServiceGeometryType,
-    fields: Vec<RestServiceField>,
+    pub(crate) geo_type: RestServiceGeometryType,
+    pub(crate) fields: Vec<RestServiceField>,
     oid_field: Option<RestServiceField>,
     max_min_oid: Option<(i64, i64)>,
     incremental_oid: Option<bool>,
@@ -308,28 +369,41 @@ impl RestServiceMetadata {
         self.server_type == "TABLE"
     }
 
-    fn pagination_query(&self, query_index: i64) -> Result<String, Box<dyn Error>> {
+    fn pagination_query(&self, query_index: i64) -> Result<String, Box<dyn Error + Send + Sync>> {
         let result_offset = format!("{}", query_index * self.scrape_count());
         let result_record_count = format!("{}", self.scrape_count());
-        let geometry_type = self.geo_type.to_string();
-        let out_spatial_reference = self.spatial_reference.unwrap_or(4269).to_string();
-        let static_options = vec![
-            ("where", "1=1"),
-            ("resultOffset", result_offset.as_str()),
-            ("resultRecordCount", result_record_count.as_str()),
-            ("geometryType", geometry_type.as_str()),
-            ("outSR", out_spatial_reference.as_str()),
-            ("outFields", "*"),
-            ("f", "json"),
+        let mut geometry_options = self.geometry_options();
+        let mut url_params = vec![
+            ("where", String::from("1=1")),
+            ("resultOffset", result_offset),
+            ("resultRecordCount", result_record_count),
+            ("outFields", String::from("*")),
+            ("f", String::from("json")),
         ];
+        url_params.append(&mut geometry_options);
         let url = Url::parse_with_params(
             format!("{}/query", self.url).as_str(),
-            static_options,
+            url_params,
         )?;
         Ok(url.to_string())
     }
 
-    fn oid_query(&self, query_index: i64) -> Result<String, Box<dyn Error>> {
+    fn geometry_options(&self) -> Vec<(&str, String)> {
+        if self.is_table() {
+            vec![]
+        } else {
+            let geometry_type = self.geo_type.to_string();
+            let out_spatial_reference = self.spatial_reference
+                .unwrap_or(4269)
+                .to_string();
+            vec![
+                ("geometryType", geometry_type),
+                ("outSR", out_spatial_reference),
+            ]
+        }
+    }
+
+    fn oid_query(&self, query_index: i64) -> Result<String, Box<dyn Error + Send + Sync>> {
         let oid_field_name = self.oid_field
             .to_owned()
             .ok_or(Box::new(RestServiceMetadataError::MissingOidField))?
@@ -345,25 +419,24 @@ impl RestServiceMetadata {
             oid_field_name,
             lower_bound + self.scrape_count() - 1,
         );
-        let geometry_type = self.geo_type.to_string();
-        let out_spatial_reference = self.spatial_reference
-            .unwrap_or(4269)
-            .to_string();
-        let static_options = vec![
-            ("where", where_clause.as_str()),
-            ("geometryType", geometry_type.as_str()),
-            ("outSR", out_spatial_reference.as_str()),
-            ("outFields", "*"),
-            ("f", "json"),
+        let mut geometry_options = self.geometry_options();
+        let mut url_params = vec![
+            ("where", where_clause),
+            ("outFields", String::from("*")),
+            ("f", String::from("json")),
         ];
+        url_params.append(&mut geometry_options);
         let url = Url::parse_with_params(
             format!("{}/query", self.url).as_str(),
-            static_options,
+            url_params,
         )?;
         Ok(url.to_string())
     }
 
-    fn queries(&self) -> Result<Vec<String>, Box<dyn Error>> {
+    pub(crate) fn queries(&self) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+        if !self.pagination_enabled && self.oid_field.is_none() {
+            return Err(Box::new(RestServiceMetadataError::MissingOidField))
+        }
         let mut result: Vec<String> = vec![];
         let mut remaining_records_count = self.source_count
             .ok_or(Box::new(RestServiceMetadataError::MissingKey("count".to_owned())))?;
@@ -408,37 +481,21 @@ fn parse_fields(
         .collect();
     match geo_type {
         RestServiceGeometryType::Point => {
-            fields.push(RestServiceField {
-                name: String::from("X"),
-                field_type: RestServiceFieldType::Double,
-                alias: String::from("X"),
-            });
-            fields.push(RestServiceField {
-                name: String::from("Y"),
-                field_type: RestServiceFieldType::Double,
-                alias: String::from("Y"),
-            });
+            fields.push(RestServiceField::for_geometry("X"));
+            fields.push(RestServiceField::for_geometry("Y"));
         }
-        RestServiceGeometryType::Multipoint => fields.push(RestServiceField {
-            name: String::from("POINTS"),
-            field_type: RestServiceFieldType::String,
-            alias: String::from("Points"),
-        }),
-        RestServiceGeometryType::Polygon => fields.push(RestServiceField {
-            name: String::from("RINGS"),
-            field_type: RestServiceFieldType::String,
-            alias: String::from("Rings"),
-        }),
-        RestServiceGeometryType::Polyline => fields.push(RestServiceField {
-            name: String::from("PATHS"),
-            field_type: RestServiceFieldType::String,
-            alias: String::from("Paths"),
-        }),
-        RestServiceGeometryType::Envelope => fields.push(RestServiceField {
-            name: String::from("ENVELOPE"),
-            field_type: RestServiceFieldType::String,
-            alias: String::from("Envelope"),
-        }),
+        RestServiceGeometryType::Multipoint => {
+            fields.push(RestServiceField::for_geometry("POINTS"))
+        },
+        RestServiceGeometryType::Polygon => {
+            fields.push(RestServiceField::for_geometry("RINGS"))
+        },
+        RestServiceGeometryType::Polyline => {
+            fields.push(RestServiceField::for_geometry("PATHS"))
+        },
+        RestServiceGeometryType::Envelope => {
+            fields.push(RestServiceField::for_geometry("ENVELOPE"))
+        },
         _ => {}
     };
     Ok(fields)
@@ -467,7 +524,7 @@ fn advanced_options(metadata_json: &Value) -> (bool, bool) {
 async fn get_service_count(
     client: &reqwest::Client,
     url: &str,
-) -> Result<Option<i64>, Box<dyn Error>> {
+) -> Result<Option<i64>, Box<dyn Error+ Sync + Send>> {
     let count_url = Url::parse_with_params(
         format!("{}/query", url).as_str(),
         [("where", "1=1"), ("returnCountOnly", "true"), ("f", "json")],
@@ -483,7 +540,7 @@ async fn get_service_count(
 async fn get_service_metadata(
     client: &reqwest::Client,
     url: &str,
-) -> Result<Value, Box<dyn Error>> {
+) -> Result<Value, Box<dyn Error+ Sync + Send>> {
     let metadata_url = Url::parse_with_params(
         url,
         [("f", "json")],
@@ -516,7 +573,7 @@ async fn get_service_max_min(
     url: &str,
     oid_field_name: String,
     stats_enabled: bool,
-) -> Result<Option<(i64, i64)>, Box<dyn Error>> {
+) -> Result<Option<(i64, i64)>, Box<dyn Error + Sync + Send>> {
     let result = if stats_enabled {
         get_service_max_min_stats(&client, url, oid_field_name).await?
     } else {
@@ -528,7 +585,7 @@ async fn get_service_max_min(
 async fn get_service_max_min_oid(
     client: &reqwest::Client,
     url: &str,
-) -> Result<Option<(i64, i64)>, Box<dyn Error>> {
+) -> Result<Option<(i64, i64)>, Box<dyn Error + Sync + Send>> {
     let max_min_url = Url::parse_with_params(
         format!("{}/query", url).as_str(),
         [("where","1=1"),("returnIdsOnly","true"),("f","json")],
@@ -552,7 +609,7 @@ async fn get_service_max_min_stats(
     client: &reqwest::Client,
     url: &str,
     oid_field_name: String,
-) -> Result<Option<(i64, i64)>, Box<dyn Error>> {
+) -> Result<Option<(i64, i64)>, Box<dyn Error + Sync + Send>> {
     let out_statistics = out_statistics_parameter(oid_field_name);
     let max_min_url = Url::parse_with_params(
         format!("{}/query", url).as_str(),
@@ -577,7 +634,7 @@ async fn get_service_max_min_stats(
 
 pub(crate) async fn request_service_metadata(
     url: &str,
-) -> Result<RestServiceMetadata, Box<dyn Error>> {
+) -> Result<RestServiceMetadata, Box<dyn Error + Sync + Send>> {
     let client = reqwest::Client::new();
     let source_count = get_service_count(&client, url).await?;
     let metadata_json = get_service_metadata(&client, url).await?;
@@ -636,7 +693,6 @@ pub(crate) async fn request_service_metadata(
         source_count,
         max_record_count,
         pagination_enabled,
-        stats_enabled,
         server_type,
         geo_type,
         fields,
