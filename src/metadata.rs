@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::io;
 use serde_json::{json, Value};
 use reqwest::Url;
+use tablestream::{Stream, col, Column};
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum RestServiceMetadataError {
@@ -91,6 +93,27 @@ pub(crate) enum RestServiceFieldType {
     SmallInteger,
     String,
     XML,
+}
+
+impl Display for RestServiceFieldType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RestServiceFieldType::Blob => write!(f, "esriFieldTypeBlob"),
+            RestServiceFieldType::Date => write!(f, "esriFieldTypeDate"),
+            RestServiceFieldType::Double => write!(f, "esriFieldTypeDouble"),
+            RestServiceFieldType::Float => write!(f, "esriFieldTypeFloat"),
+            RestServiceFieldType::Geometry => write!(f, "esriFieldTypeGeometry"),
+            RestServiceFieldType::GlobalID => write!(f, "esriFieldTypeGlobalID"),
+            RestServiceFieldType::GUID => write!(f, "esriFieldTypeGUID"),
+            RestServiceFieldType::Integer => write!(f, "esriFieldTypeInteger"),
+            RestServiceFieldType::OID => write!(f, "esriFieldTypeOID"),
+            RestServiceFieldType::Raster => write!(f, "esriFieldTypeRaster"),
+            RestServiceFieldType::Single => write!(f, "esriFieldTypeSingle"),
+            RestServiceFieldType::SmallInteger => write!(f, "esriFieldTypeSmallInteger"),
+            RestServiceFieldType::String => write!(f, "esriFieldTypeString"),
+            RestServiceFieldType::XML => write!(f, "esriFieldTypeXML"),
+        }
+    }
 }
 
 impl RestServiceFieldType {
@@ -297,7 +320,7 @@ fn parse_domain(
 }
 
 impl RestServiceField {
-    fn new(field: &Value) -> Result<RestServiceField, RestServiceMetadataError> {
+    fn new(field: &Value) -> Result<Self, RestServiceMetadataError> {
         let field_name = field["name"]
             .as_str()
             .ok_or(
@@ -325,7 +348,7 @@ impl RestServiceField {
         let field_type_enum = RestServiceFieldType::from_str(field_type)?;
         let domain_value = &field["domain"];
         let codes = parse_domain(domain_value)?;
-        let result = RestServiceField {
+        let result = Self {
             name: field_name.to_owned(),
             field_type: field_type_enum,
             alias: field_alias.to_owned(),
@@ -356,8 +379,8 @@ pub(crate) struct RestServiceMetadata {
     pub(crate) fields: Vec<RestServiceField>,
     oid_field: Option<RestServiceField>,
     max_min_oid: Option<(i64, i64)>,
-    incremental_oid: Option<bool>,
-    spatial_reference: Option<i64>,
+    source_spatial_reference: Option<i64>,
+    output_spatial_reference: Option<i64>,
 }
 
 impl RestServiceMetadata {
@@ -369,10 +392,22 @@ impl RestServiceMetadata {
         self.server_type == "TABLE"
     }
 
+    fn incremental_oid(&self) -> bool {
+        if self.oid_field.is_none() {
+            return false;
+        }
+        if let Some(max_min) = self.max_min_oid {
+            let difference = max_min.0 - max_min.1 + 1;
+            self.source_count.map(|count| difference == count).unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
     fn pagination_query(&self, query_index: i64) -> Result<String, Box<dyn Error + Send + Sync>> {
         let result_offset = format!("{}", query_index * self.scrape_count());
         let result_record_count = format!("{}", self.scrape_count());
-        let mut geometry_options = self.geometry_options();
+        let mut geometry_options = self.geometry_options()?;
         let mut url_params = vec![
             ("where", String::from("1=1")),
             ("resultOffset", result_offset),
@@ -388,18 +423,22 @@ impl RestServiceMetadata {
         Ok(url.to_string())
     }
 
-    fn geometry_options(&self) -> Vec<(&str, String)> {
+    fn geometry_options(&self) -> Result<Vec<(&str, String)>, &str> {
         if self.is_table() {
-            vec![]
+            Ok(vec![])
         } else {
             let geometry_type = self.geo_type.to_string();
-            let out_spatial_reference = self.spatial_reference
-                .unwrap_or(4269)
+            let out_spatial_reference = self.output_spatial_reference
+                .unwrap_or(
+                    self.source_spatial_reference.ok_or(
+                        "No source spatial reference and no output spatial reference specified"
+                    )?
+                )
                 .to_string();
-            vec![
+            Ok(vec![
                 ("geometryType", geometry_type),
                 ("outSR", out_spatial_reference),
-            ]
+            ])
         }
     }
 
@@ -419,7 +458,7 @@ impl RestServiceMetadata {
             oid_field_name,
             lower_bound + self.scrape_count() - 1,
         );
-        let mut geometry_options = self.geometry_options();
+        let mut geometry_options = self.geometry_options()?;
         let mut url_params = vec![
             ("where", where_clause),
             ("outFields", String::from("*")),
@@ -456,6 +495,40 @@ impl RestServiceMetadata {
             }
         }
         Ok(result)
+    }
+
+    pub(crate) fn write_to_console(&self) -> io::Result<()> {
+        println!("URL: {}", self.url);
+        println!("Name: {}", self.name);
+        println!("Feature Count: {}", self.source_count.unwrap_or(-1));
+        println!("Max Scrape Chunk Count: {}", self.max_record_count);
+        println!("Server Type: {}", self.server_type);
+        if !self.is_table() {
+            println!("Geometry Type: {}", self.geo_type);
+        }
+        let mut out = io::stdout();
+        let mut stream = Stream::new(
+            &mut out,
+            vec![
+                col!(RestServiceField: .name).header("Name"),
+                col!(RestServiceField: .field_type).header("Type"),
+                col!(RestServiceField: .alias).header("Alias"),
+                Column::new(|f, c: &RestServiceField| {
+                    write!(f, "{}", &c.codes.is_some())
+                }).header("Is Coded?"),
+            ],
+        );
+        for field in self.fields.iter() {
+            stream.row(field.to_owned())?;
+        }
+        stream.finish()?;
+        if let Some(oid_field) = &self.oid_field {
+            println!("OID Field: {}", oid_field.name);
+        }
+        if let Some(reference) = &self.source_spatial_reference {
+            println!("Service Spatial Reference: {}", reference);
+        }
+        Ok(())
     }
 }
 
@@ -634,6 +707,7 @@ async fn get_service_max_min_stats(
 
 pub(crate) async fn request_service_metadata(
     url: &str,
+    output_spatial_reference: Option<i64>,
 ) -> Result<RestServiceMetadata, Box<dyn Error + Sync + Send>> {
     let client = reqwest::Client::new();
     let source_count = get_service_count(&client, url).await?;
@@ -681,12 +755,6 @@ pub(crate) async fn request_service_metadata(
     } else {
         None
     };
-    let incremental_oid = if let Some(max_min) = max_min_oid {
-        let difference = max_min.0 - max_min.1 + 1;
-        source_count.map(|count| difference == count)
-    } else {
-        None
-    };
     let rest_metadata = RestServiceMetadata {
         url: url.to_owned(),
         name,
@@ -698,8 +766,8 @@ pub(crate) async fn request_service_metadata(
         fields,
         oid_field,
         max_min_oid,
-        incremental_oid,
-        spatial_reference,
+        source_spatial_reference: spatial_reference,
+        output_spatial_reference,
     };
     Ok(rest_metadata)
 }
