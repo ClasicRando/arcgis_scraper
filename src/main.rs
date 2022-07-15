@@ -4,7 +4,7 @@ mod scraping;
 use metadata::request_service_metadata;
 use std::error::Error;
 use std::fs::{create_dir, File};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Seek, SeekFrom, Write};
 use tokio::task::JoinHandle;
 use std::{env, io};
 use std::path::Path;
@@ -13,6 +13,7 @@ use clap::Parser;
 use console::{style};
 use indicatif::{ProgressBar, ProgressStyle, HumanDuration};
 use conv::*;
+use geojson::{GeoJson};
 
 #[derive(Parser,Debug)]
 #[clap(author = "Steven Thomson", version = "0.0.1", about, long_about = None)]
@@ -24,7 +25,7 @@ struct ProgramArguments {
     #[clap(short ='r', long, value_parser, default_value_t = 5)]
     query_retires: i32,
     #[clap(short = 's', long, value_parser)]
-    output_spatial_reference: Option<i64>,
+    output_spatial_reference: Option<i32>,
     #[clap(short = 'd', long, value_parser, default_value_t = false)]
     format_date: bool,
 }
@@ -64,15 +65,13 @@ async fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     println!("{} Spawning fetch workers", style("[1/4]").bold().dim());
     for query in queries {
         let fields = result.fields.clone();
-        let geo_type = result.geo_type.clone();
-        let retries = args.query_retires.clone();
+        let retries = 10;//args.query_retires.clone();
         let handle = tokio::spawn(async move {
             let client = reqwest::Client::new();
             let temp_file = scraping::fetch_query(
                 &client,
                 &query,
                 &fields,
-                &geo_type,
                 retries,
             ).await?;
             Ok(temp_file)
@@ -86,26 +85,10 @@ async fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     if !output_path.is_dir() {
         create_dir(output_path)?;
     }
-    let output_filename = format!("{}/{}.csv", output_path.display(), result.name);
+    let output_filename = format!("{}/{}.geojson", output_path.display(), result.name);
     let mut output_file = File::create(output_filename)?;
-    println!("{} Writing header line to output", style("[3/4]").bold().dim());
-    let header_line = result.fields.iter()
-        .map(|field|
-            if field.codes.is_some() {
-                vec![field.name.clone(), format!("{}_DESC", field.name)]
-            } else {
-                vec![field.name.clone()]
-            }
-        )
-        .flatten()
-        .collect::<Vec<String>>()
-        .iter()
-        .map(|name| scraping::handle_csv_value(name))
-        .collect::<Vec<String>>()
-        .join(",");
-    writeln!(&mut output_file, "{}", header_line)?;
 
-    println!("{} Collecting fetch worker output", style("[4/4]").bold().dim());
+    println!("{} Collecting fetch worker output", style("[3/3]").bold().dim());
     let progress_style = ProgressStyle::with_template(
         "{bar:80.cyan/blue} {pos:>7}/{len:7} {msg}"
     )?.progress_chars("##-");
@@ -113,20 +96,37 @@ async fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     let query_progress = ProgressBar::new(progress_max);
     query_progress.set_style(progress_style);
     query_progress.inc(0);
+    let mut progress = 0;
 
-    for (i, handle) in fetch_worker_handles.into_iter().enumerate() {
+    for handle in fetch_worker_handles {
         let result = handle.await?;
+        progress += 1;
         query_progress.inc(1);
-        query_progress.set_message(format!("Query #{}", i + 1));
+        query_progress.set_message(format!("Query #{}", progress));
         if let Err(error) = result {
+            println!("Error from temp file fetch");
             return Err(error)
         }
         let mut temp_file = result.unwrap();
         temp_file.seek(SeekFrom::Start(0))?;
-        let mut buffer = Vec::new();
-        if let Ok(_) = temp_file.read_to_end(&mut buffer) {
-            output_file.write(&mut buffer)?;
+        let buffered_reader = BufReader::new(temp_file);
+        let geojson = GeoJson::from_reader(buffered_reader)?;
+        if let GeoJson::FeatureCollection(collection) = geojson {
+            if output_file.stream_position()? == 0 {
+                write!(output_file, "{{\"type\":\"FeatureCollection\",")?;
+                if let Some(members) = collection.foreign_members {
+                    if let Some(crs) = members.get("crs") {
+                        write!(output_file, "\"crs\":{},", crs)?;
+                    }
+                }
+                write!(output_file, "\"features\":[")?;
+            }
+            for feature in collection.features {
+                write!(output_file, "{},", feature.to_string())?;
+            }
         }
+        output_file.seek(SeekFrom::Current(-1))?;
+        write!(output_file, "]}}")?;
         output_file.sync_all()?;
     }
     query_progress.finish_and_clear();
